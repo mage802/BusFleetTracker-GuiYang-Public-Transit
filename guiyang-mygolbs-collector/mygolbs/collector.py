@@ -10,7 +10,7 @@ import uuid
 
 from .api import AccessDenied, ApiError, Client, classify_realtime, is_transient
 from .storage import Store, now, write_json
-
+from .operations import extract_operations
 
 def select_targets(catalog, settings):
     rows = catalog.get("buslines")
@@ -19,6 +19,7 @@ def select_targets(catalog, settings):
     names = set(settings.get("lines", []))
     found = set()
     targets = {}
+    endpoints = {}
     for row in rows:
         line, direction = row.get("lineName"), str(row.get("upperOrDown"))
         if not line or direction not in ("1", "2"):
@@ -36,12 +37,20 @@ def select_targets(catalog, settings):
                 continue
         found.add(line)
         targets.setdefault((line, direction), set()).add(company)
+        endpoints.setdefault((line, direction),{"from_station": str(row.get("from") or ""),"to_station": str(row.get("to") or ""),},)
     if names - found:
         raise ValueError("Requested lines absent from selected catalog: " + ", ".join(sorted(names - found)))
     if not targets:
         raise ValueError("No lines matched the filters")
-    return [dict(line=line, direction=direction, companies=sorted(companies))
-            for (line, direction), companies in sorted(targets.items())]
+    return [
+        dict(
+            line=line,
+            direction=direction,
+            companies=sorted(companies),
+            **endpoints[(line, direction)],
+        )
+        for (line, direction), companies in sorted(targets.items())
+    ]
 
 
 def catalog_with_retry(client, retries, pause):
@@ -80,6 +89,28 @@ def run(settings, resume=None):
     # Include both city selectors in the key; name-only profiles remain distinct.
     city = settings["city_name"] + "|" + str(settings.get("city_code") or "")
     targets = meta["targets"]
+
+    # 兼容旧任务：从创建任务时保存的目录中恢复终点站。
+    if any("to_station" not in target for target in targets):
+        catalog = json.loads(
+            (folder / "catalog.json").read_text(encoding="utf-8")
+        )
+        endpoints = {
+            (row.get("lineName"), str(row.get("upperOrDown"))): row
+            for row in catalog.get("buslines", [])
+        }
+
+        for target in targets:
+            row = endpoints.get(
+                (target["line"], target["direction"]), {}
+            )
+            target.setdefault(
+                "from_station", str(row.get("from") or "")
+            )
+            target.setdefault(
+                "to_station", str(row.get("to") or "")
+            )
+
     workers = settings["workers"]
     all_rounds = settings["rounds"]
     job_id = meta["job"]
@@ -97,7 +128,21 @@ def run(settings, resume=None):
         except Exception as error:
             result.update(outcome="failed", error=f"{type(error).__name__}: {error}",
                           retryable=is_transient(error), blocked=isinstance(error, AccessDenied))
-        result.update(observed_at=now(), seconds=round(time.monotonic() - begin, 3))
+
+
+        result.update(
+            observed_at=now(),
+            seconds=round(time.monotonic() - begin, 3),
+        )
+
+        if result.get("outcome") == "success":
+            result["operations"] = extract_operations(
+                result["response"],
+                target["line"],
+                target.get("to_station", ""),
+                result["observed_at"],
+            )
+
         return result
 
     def checkpoint():
