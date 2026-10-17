@@ -8,6 +8,7 @@ import secrets
 import sqlite3
 import threading
 import time
+import operation_records
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -145,6 +146,7 @@ def initialize(folder):
         ''')
         db.execute('INSERT OR IGNORE INTO meta VALUES(?,?)',
                    ('guest', 'browser_' + str(int(time.time()*1000)) + '_' + secrets.token_hex(4)))
+        db.execute(operation_records.SCHEMA)
 
 
 class Client:
@@ -272,6 +274,7 @@ def vehicles(data):
 
 def export(folder, day):
     with connect(folder / 'state.sqlite3') as db:
+        operation_records.export(db, folder, day)
         rows = db.execute('SELECT city_id,line_id,bus_id,licence,first_seen,last_seen '
                           'FROM observations WHERE day=? ORDER BY city_id,bus_id,line_id', (day,)).fetchall()
         cov = db.execute('SELECT observed_at,city_id,line_id,status,raw_count,live_count,missing_ids,error '
@@ -301,6 +304,8 @@ def export(folder, day):
 def store(folder, city, lid, stamp, data=None, error=''):
     entries, raw, missing = vehicles(data) if data is not None else ([], None, None)
     with connect(folder / 'state.sqlite3') as db:
+        if data is not None:
+                operation_records.insert(db, data, city, stamp)
         for row in entries:
             db.execute('INSERT INTO observations VALUES(?,?,?,?,?,?,?) '
                        'ON CONFLICT(day,city_id,line_id,bus_id) DO UPDATE SET '
