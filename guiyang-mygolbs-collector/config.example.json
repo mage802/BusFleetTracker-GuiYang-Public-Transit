@@ -1,0 +1,13 @@
+{
+  "city_name": "贵阳市",
+  "city_code": "520100",
+  "company_prefixes": ["贵阳公交", "贵阳黔爽"],
+  "output": "data",
+  "workers": 1,
+  "batch_pause": 3,
+  "timeout": 25,
+  "retries": 3,
+  "rounds": 1,
+  "pause": 300,
+  "save_raw": false
+}
