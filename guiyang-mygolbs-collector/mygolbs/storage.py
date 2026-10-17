@@ -4,7 +4,7 @@ import datetime as dt
 import json
 import sqlite3
 from pathlib import Path
-
+from .operations import HEADER
 TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -32,7 +32,31 @@ class Store:
         CREATE TABLE IF NOT EXISTS sightings(
           day TEXT, city TEXT, line TEXT, direction TEXT, vehicle TEXT,
           first_seen TEXT, last_seen TEXT, observations INTEGER,
+
+
           PRIMARY KEY(day,city,line,direction,vehicle));
+
+        CREATE TABLE IF NOT EXISTS operation_records(
+          job TEXT,
+          round INTEGER,
+          line TEXT,
+          direction TEXT,
+          attempt INTEGER,
+          bus_index INTEGER,
+          city TEXT,
+          vehicle TEXT,
+          route TEXT,
+          terminal TEXT,
+          next_station TEXT,
+          distance_m REAL,
+          observed_at TEXT,
+          source_time TEXT,
+          status_type TEXT,
+          quality TEXT,
+          PRIMARY KEY(
+            job,round,line,direction,attempt,bus_index
+          )
+        );
         """)
 
     def state(self, job, round_number):
@@ -55,6 +79,35 @@ class Store:
             if not cursor.rowcount:
                 return  # Same attempt replayed after an interrupted checkpoint.
             if result["outcome"] == "success":
+                for index, record in enumerate(
+                    result.get("operations", [])
+                ):
+                    self.db.execute(
+                        """
+                        INSERT INTO operation_records VALUES(
+                            ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+                        )
+                        """,
+                        (
+                            job,
+                            round_number,
+                            line,
+                            direction,
+                            attempt,
+                            index,
+                            city,
+                            record["vehicle"],
+                            record["route"],
+                            record.get("terminal", ""),
+                            record.get("next_station", ""),
+                            record.get("distance_m"),
+                            stamp,
+                            record.get("source_time"),
+                            record.get("status_type", ""),
+                            record.get("quality", ""),
+                        ),
+                    )
+
                 for vehicle in ids:
                     self.db.execute("""INSERT INTO sightings VALUES(?,?,?,?,?,?,?,1)
                         ON CONFLICT(day,city,line,direction,vehicle) DO UPDATE SET
@@ -73,15 +126,102 @@ class Store:
         temp.replace(path)
 
     def export_daily(self, root):
-        for name, sql in [
-            ("daily_by_direction.csv", "SELECT * FROM sightings ORDER BY day,city,line,direction,vehicle"),
-            ("daily_by_line.csv", """SELECT day,city,line,vehicle,MIN(first_seen) first_seen,
-                MAX(last_seen) last_seen FROM sightings GROUP BY day,city,line,vehicle
-                ORDER BY day,city,line,vehicle""")]:
+        queries = [
+            (
+                "daily_by_direction.csv",
+                """
+                SELECT *
+                FROM sightings
+                ORDER BY day,city,line,direction,vehicle
+                """,
+            ),
+            (
+                "daily_by_line.csv",
+                """
+                SELECT
+                    day,
+                    city,
+                    line,
+                    vehicle,
+                    MIN(first_seen) AS first_seen,
+                    MAX(last_seen) AS last_seen
+                FROM sightings
+                GROUP BY day,city,line,vehicle
+                ORDER BY day,city,line,vehicle
+                """,
+            ),
+        ]
+
+        for name, sql in queries:
             cursor = self.db.execute(sql)
-            self.csv(root / name, [c[0] for c in cursor.description], cursor)
+            self.csv(
+                root / name,
+                [column[0] for column in cursor.description],
+                cursor,
+            )
+
+        self.export_operations(root)
+
+    def export_operations(self, root, job=None):
+        columns = (
+            "vehicle,route,terminal,"
+            "next_station,distance_m,observed_at"
+        )
+        order = (
+            " ORDER BY observed_at,line,direction,"
+            "vehicle,job,round,attempt,bus_index"
+        )
+
+        if job is None:
+            condition = ""
+            params = ()
+        else:
+            condition = " WHERE job=?"
+            params = (job,)
+
+        cursor = self.db.execute(
+            "SELECT "
+            + columns
+            + " FROM operation_records"
+            + condition
+            + order,
+            params,
+        )
+
+        self.csv(root / "operation_records.csv", HEADER, cursor)
+
+        if job is None:
+            days = [
+                row[0]
+                for row in self.db.execute(
+                    """
+                    SELECT DISTINCT substr(observed_at,1,10)
+                    FROM operation_records
+                    """
+                )
+            ]
+
+            for day in days:
+                folder = root / day
+                folder.mkdir(exist_ok=True)
+
+                cursor = self.db.execute(
+                    "SELECT "
+                    + columns
+                    + " FROM operation_records"
+                    + " WHERE substr(observed_at,1,10)=?"
+                    + order,
+                    (day,),
+                )
+
+                self.csv(
+                    folder / "operation_records.csv",
+                    HEADER,
+                    cursor,
+                )
 
     def export_job(self, root, job):
+        self.export_operations(root,job)
         cursor = self.db.execute("""SELECT round,line,direction,attempt,observed_at,company,
             outcome,identifiers,error,retryable,seconds,raw_file FROM attempts
             WHERE job=? ORDER BY round,line,direction,attempt""", (job,))
