@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import chelaile as c
+import operation_records as op
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -52,9 +53,9 @@ class CoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             folder=Path(name);c.initialize(folder)
             for lid, stamp in [('forward','2026-10-17T10:00:00+08:00'),('reverse','2026-10-17T11:00:00+08:00')]:
-                c.store(folder,'083',lid,stamp,{'buses':[{'busId':'007274'}]})
+                c.store(folder,'083',lid,stamp,{'line':{'lineId':lid},'buses':[{'busId':'007274'}]})
             c.initialize(folder)
-            c.store(folder,'083','forward','2026-10-17T12:00:00+08:00',{'buses':[{'busId':'007274','licence':'label'}]})
+            c.store(folder,'083','forward','2026-10-17T12:00:00+08:00',{'line':{'lineId':'forward'},'buses':[{'busId':'007274','licence':'label'}]})
             c.export(folder,'2026-10-17')
             rows=json.loads((folder/'2026-10-17/vehicle_list.json').read_text(encoding='utf-8'))
             self.assertEqual(len(rows),1)
@@ -62,6 +63,31 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(set(rows[0]['line_ids']),{'forward','reverse'})
             self.assertIn('10:00:00',rows[0]['first_seen'])
             self.assertIn('12:00:00',rows[0]['last_seen'])
+
+    def test_operation_history_keeps_later_captures_and_import_is_idempotent(self):
+        data={'line':{'lineId':'a','name':'3','endSn':'B'},
+              'stations':[{'order':1,'sn':'A'},{'order':2,'sn':'B'}],
+              'buses':[{'busId':'001','order':1,'state':0,'distanceToSc':123}]}
+        with tempfile.TemporaryDirectory() as name:
+            folder=Path(name);c.initialize(folder)
+            for stamp in ['2026-10-17T10:00:00+08:00']*2+['2026-10-17T10:05:00+08:00']:
+                c.store(folder,'083','a',stamp,data)
+            with c.connect(folder/'state.sqlite3') as db:
+                self.assertEqual(db.execute('SELECT count(*) FROM operation_records').fetchone()[0],2)
+                self.assertEqual(db.execute('SELECT count(*) FROM observations').fetchone()[0],1)
+                self.assertEqual(db.execute('SELECT next_distance_m FROM operation_records LIMIT 1').fetchone()[0],123)
+
+    def test_at_stop_displays_current_station_and_zero(self):
+        data={'line':{'lineId':'a'},'stations':[{'order':1,'sn':'A'},{'order':2,'sn':'B'}],
+              'buses':[{'busId':'001','order':1,'state':1,'distanceToSc':0,'distanceToWaitStn':999}]}
+        row=list(op.records(data,'083','2026-10-17T10:00:00+08:00'))[0]
+        self.assertEqual(row[8],'A')
+        self.assertEqual(row[9],0)
+        self.assertEqual(row[12],'at_stop_current_station_zero_distance')
+        data['buses'][0]['order']=2
+        row=list(op.records(data,'083','2026-10-17T10:00:00+08:00'))[0]
+        self.assertEqual(row[8],'B')
+        self.assertEqual(row[9],0)
 
     def test_scan_records_partial_failures_and_unions_all_directions_offline(self):
         with tempfile.TemporaryDirectory() as name:
@@ -74,7 +100,7 @@ class CoreTests(unittest.TestCase):
                 def detail(self,city,line):
                     if line['line_id']=='broken':
                         raise ValueError('Fixture missing buses')
-                    return {'buses':[{'busId':'001'}]}
+                    return {'line':{'lineId':line['line_id']},'buses':[{'busId':'001'}]}
             with patch.object(c,'Client',OfflineClient),patch.object(sys,'argv',
                     ['chelaile.py','scan','--out',name,'--workers','2']):
                 c.main()
